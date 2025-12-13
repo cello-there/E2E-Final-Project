@@ -9,6 +9,8 @@ import time
 import torch
 import torch.nn as nn
 
+from peft import PeftModel
+
 from .preprocessing import PreprocessConfig, build_image_transform, TextPreprocessor
 
 
@@ -285,7 +287,9 @@ def build_siglip2_wrapper(
     You may need to adapt the internal calls depending on the exact
     model class (e.g., SiglipModel, VisionTextDualEncoderModel, etc.).
     """
-    from transformers import AutoProcessor, AutoModel, AutoTokenizer
+    from transformers.models.auto.processing_auto import AutoProcessor
+    from transformers.models.auto.modeling_auto import AutoModel
+    from transformers.models.auto.tokenization_auto import AutoTokenizer
     # Prefer fast processors/tokenizers for fair runtime comparison
     try:
         processor = AutoProcessor.from_pretrained(hf_name, use_fast=True)
@@ -309,7 +313,8 @@ def build_siglip2_wrapper(
     def native_txt_pre(texts: List[str], device: torch.device) -> Dict[str, torch.Tensor]:
         proc = processor(
             text=texts,
-            padding=True,
+            padding="max_length",
+            max_length = 64,
             truncation=True,
             return_tensors="pt",
         )
@@ -384,8 +389,9 @@ def build_siglip2_wrapper(
 
 def build_vlm2vecv2_wrapper(
     cfg: ModelConfig,
-    hf_name: str = "VLM2Vec/VLM2Vec-V2.0",
 ) -> VLModelWrapper:
+    hf_name = "VLM2Vec/VLM2Vec-V2.0"
+    #hf_name = "Qwen/Qwen2-VL-7B-Instruct"
     """
     VLM2Vec-V2 wrapper using the published HF weights.
 
@@ -397,15 +403,22 @@ def build_vlm2vecv2_wrapper(
     NOTE: This is a pragmatic integration for your benchmark, not a
     full reimplementation of their MMEBModel pipeline.
     """
-    from transformers import AutoProcessor, AutoModel, AutoTokenizer
+    from transformers.models.auto.processing_auto import AutoProcessor
+    from transformers.models.auto.modeling_auto import AutoModel
+    from transformers.models.auto.tokenization_auto import AutoTokenizer
 
     try:
         processor = AutoProcessor.from_pretrained(hf_name, use_fast=True)
     except TypeError:
         processor = AutoProcessor.from_pretrained(hf_name)
+    #adapter_name = "TIGER-Lab/VLM2Vec-Qwen2VL-7B"
 
+    #base = AutoModel.from_pretrained(hf_name, trust_remote_code=True, low_cpu_mem_usage=True)
+    #adapter_path = adapter_name[0] if isinstance(adapter_name, tuple) else adapter_name
+    #hf_model = PeftModel.from_pretrained(base, adapter_name).to(cfg.device)
+    
     hf_model = AutoModel.from_pretrained(hf_name).to(cfg.device)
-
+    
 
     # -------------------------------------------------
     # Native preprocessing (TEXT)
@@ -562,9 +575,9 @@ def build_vlm2vecv2_wrapper(
             out = hf_model(**toks)
 
             if hasattr(out, "text_embeds"):
-                return out.text_embeds
+                return l2_normalize(out.text_embeds, dim=-1)
             if hasattr(out, "last_hidden_state"):
-                return out.last_hidden_state.mean(dim=1)
+                return l2_normalize(out.last_hidden_state.mean(dim=1))
 
             raise RuntimeError("VLM2Vec-V2: could not find text embeddings in model output.")
 

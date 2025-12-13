@@ -42,6 +42,7 @@ Datasets:
 This matches the MS-COCO-5k, Flickr30k-1k, and CIRR usage described in the proposal.
 """
 
+from __future__ import annotations
 import argparse
 import json
 import math
@@ -49,6 +50,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from torch.utils.data import Dataset, DataLoader
 
 import numpy as np
 import torch
@@ -96,8 +98,25 @@ DATA_ROOT = Path("data")
 #     ),
 # }
 
-DATA_ROOT = Path("data")         # where the *index* JSONs live
-DATASETS_ROOT = Path("datasets") # where the raw datasets live (your coco2014 folder)
+DATA_ROOT = Path("DATA")         # where the *index* JSONs live
+DATASETS_ROOT = Path("DATA") # where the raw datasets live (your coco2014 folder)
+
+# BENCHMARKS: Dict[str, BenchmarkSpec] = {
+#     # Mini COCO benchmark for pipeline sanity testing
+#     "coco_mini": BenchmarkSpec(
+#         name="coco_mini",
+#         image_root=DATASETS_ROOT / "coco2014",
+#         index_json=DATA_ROOT / "coco" / "coco_mini_index.json",
+#     ),
+
+#     # Mini Flickr30k benchmark
+#     "flickr30k_mini": BenchmarkSpec(
+#         name="flickr30k_mini",
+#         # Images live under datasets/fickr_30k/images/
+#         image_root=DATASETS_ROOT / "flickr_30k",
+#         index_json=DATASETS_ROOT / "flickr" / "flickr30k_mini_index.json",
+#     ),
+# }
 
 BENCHMARKS: Dict[str, BenchmarkSpec] = {
     # Mini COCO benchmark for pipeline sanity testing
@@ -111,10 +130,25 @@ BENCHMARKS: Dict[str, BenchmarkSpec] = {
     "flickr30k_mini": BenchmarkSpec(
         name="flickr30k_mini",
         # Images live under datasets/fickr_30k/images/
-        image_root=DATASETS_ROOT / "fickr_30k",
-        index_json=DATASETS_ROOT / "fickr_30k" / "flickr30k_mini_index.json",
+        image_root=DATASETS_ROOT / "flickr_30k",
+        index_json=DATASETS_ROOT / "flickr" / "flickr30k_mini_index.json",
+    ),
+    # Mini COCO benchmark for pipeline sanity testing
+    "coco": BenchmarkSpec(
+        name="coco",
+        image_root=DATASETS_ROOT / "coco2014",
+        index_json=DATA_ROOT / "coco" / "coco_val2014_index.json",
+    ),
+
+    # Mini Flickr30k benchmark
+    "flickr30k": BenchmarkSpec(
+        name="flickr30k",
+        # Images live under datasets/fickr_30k/images/
+        image_root=DATASETS_ROOT / "flickr_30k",
+        index_json=DATASETS_ROOT / "flickr" / "flickr30k_index.json",
     ),
 }
+
 
 
 def load_benchmark(spec: BenchmarkSpec) -> Tuple[List[Image.Image], List[str], List[List[int]]]:
@@ -139,14 +173,13 @@ def load_benchmark(spec: BenchmarkSpec) -> Tuple[List[Image.Image], List[str], L
     with spec.index_json.open("r", encoding="utf-8") as f:
         items = json.load(f)
 
-    images: List[Image.Image] = []
+    image_paths: List[Path] = []
     all_captions: List[str] = []
     img_to_cap_indices: List[List[int]] = []
 
     for item in items:
         img_path = spec.image_root / item["image"]
-        img = Image.open(img_path).convert("RGB")
-        images.append(img)
+        image_paths.append(img_path)
 
         caps = item["captions"]
         cap_indices = []
@@ -155,8 +188,23 @@ def load_benchmark(spec: BenchmarkSpec) -> Tuple[List[Image.Image], List[str], L
             all_captions.append(cap)
         img_to_cap_indices.append(cap_indices)
 
-    return images, all_captions, img_to_cap_indices
+    return image_paths, all_captions, img_to_cap_indices
 
+class ImagePathDataset(Dataset):
+    def __init__(self, paths: List[Path]):
+        self.paths=paths
+    
+    def __len__(self) -> ints:
+        return len(self.paths)
+    
+    def __getitem__(self, idx: int):
+        p = self.paths[idx]
+
+        with Image.open(p) as im:
+            return im.convert("RGB")
+
+def pil_collate(batch):
+    return batch
 
 # ================================================================
 #  Retrieval metrics (Recall@K)
@@ -233,12 +281,21 @@ def compute_image_to_text_recall(
 #  Encoding with warmup + global timing
 # ================================================================
 
+def _load_rgb_batch(paths: List[Path]) -> List[Image.Image]:
+    imgs:List[Image.Image] = []
+    for p in paths:
+        with Image.open(p) as im:
+            imgs.append(im.convert("RGB"))
+    return imgs
+
 def encode_all_images(
     model,
-    images: List[Image.Image],
+    image_paths: List[Path],
     device: torch.device,
     batch_size: int,
     warmup_batches: int = 1,
+    num_workers: int = 8,
+    prefetch_factor: int = 4 
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Encode all images with warmup.
@@ -248,18 +305,30 @@ def encode_all_images(
       stats: dict with total_time_s, throughput_imgs_per_s, peak_mem_mb, etc.
     """
     model.eval()
-    n = len(images)
-    num_batches = math.ceil(n / batch_size)
+
+    ds = ImagePathDataset(image_paths)
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory = (device.type == "cuda"),
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=(num_workers > 0),
+        collate_fn = pil_collate,
+        drop_last = False,
+    )
 
     # --- Warmup (excluded from timing) ---
     with torch.no_grad():
-        for b in range(min(warmup_batches, num_batches)):
-            batch_imgs = images[b * batch_size : (b + 1) * batch_size]
+        for i, batch_imgs in enumerate(loader):
             _embs, _ = model.encode_images(
                 batch_imgs,
                 normalize=True,
                 return_stats=False,
             )
+            if i + 1 >= warmup_batches:
+                break
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -269,8 +338,7 @@ def encode_all_images(
     all_embs: List[torch.Tensor] = []
 
     with torch.no_grad():
-        for b in range(num_batches):
-            batch_imgs = images[b * batch_size : (b + 1) * batch_size]
+        for batch_imgs in loader:
             embs, _ = model.encode_images(
                 batch_imgs,
                 normalize=True,
@@ -283,6 +351,8 @@ def encode_all_images(
         peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
     else:
         peak_mem_mb = float("nan")
+    
+    n = len(ds)
 
     total_time_s = time.perf_counter() - start
     throughput = n / total_time_s if total_time_s > 0 else float("nan")
@@ -446,8 +516,8 @@ def run_single_benchmark(
     model = model_builder(cfg)
 
     # ----------------- Load data -----------------
-    images, all_captions, img_to_cap_indices = load_benchmark(spec)
-    n_images = len(images)
+    image_paths, all_captions, img_to_cap_indices = load_benchmark(spec)
+    n_images = len(image_paths)
     m_caps = len(all_captions)
     print(f"Loaded {n_images} images and {m_caps} captions from {spec.index_json}")
 
@@ -460,7 +530,7 @@ def run_single_benchmark(
     # ----------------- Encode images -----------------
     img_embeds, img_stats = encode_all_images(
         model=model,
-        images=images,
+        image_paths=image_paths,
         device=device,
         batch_size=image_batch_size,
         warmup_batches=warmup_batches,
