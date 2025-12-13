@@ -432,7 +432,8 @@ def build_vlm2vecv2_wrapper(
     def native_txt_pre(texts: List[str], device: torch.device) -> Dict[str, torch.Tensor]:
         proc = processor(
             text=texts,
-            padding=True,
+            padding="max_length",
+            max_length = 64,
             truncation=True,
             return_tensors="pt",
         )
